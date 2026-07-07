@@ -11,31 +11,6 @@ Every stage is a small, single-responsibility function ("tool") that takes plain
 inputs and returns a JSON-friendly summary alongside any heavy artifacts. That
 shape lets the pipeline run two ways:
 
-    1. As a plain script          ->  run_pipeline(...)
-    2. As agent tools             ->  wrap each fetch_/review_/fit_/run_/check_
-                                       function as a tool in IBM watsonx Agent Lab
-                                       or a LangGraph ReAct agent.
-
-The agent reads each stage's summary dict and decides the next step (e.g. "quality
-verdict = reject -> stop" or "not converged -> rerun with more samples").
-
-Pipeline stages
----------------
-    fetch  ->  review_data_quality  ->  fit_map  ->  run_nuts  ->  check_convergence  ->  summarize_posterior
-
-Notes on what changed vs. a naive first draft
---------------------------------------------
-  * No global mutable download cache. Data flows through return values.
-  * A single source of truth for the likelihood: the NUTS sampler reuses the
-    exact same NumPyro model as the MAP fit, so there is no separately hand-coded
-    log-probability that can silently drift out of sync.
-  * The quality gate removes corrupted samples and returns an agent-readable
-    verdict, instead of overwriting bad flux with a placeholder value.
-  * Limb darkening uses numpyro_ext.QuadLDParams, which enforces the physical
-    quadratic-LD constraints for you.
-  * Heavy / optional deps (lightkurve, matplotlib, corner) are imported lazily
-    inside the functions that need them, so the inference core runs without them.
-"""
 
 from __future__ import annotations
 
