@@ -1,7 +1,5 @@
 # Astronopy
 
-The agentic pipeline is built on top of a python preprocessing pipeline that stitched multi-quarter Kepler light curves and automatically flagged and neutralized corrupted (non-finite) instrument readings before inference, preventing bad input data from silently propagating into downstream results.
+This repository hosts an Agentic AI Pipeline deployed on IBM watsonx designed to automate the fetching, quality-reviewing, and precision-fitting of multi-quarter Kepler light curves.
 
-Agentic AI pipeline on IBM watsonx that fetches, quality-reviews, and fits Kepler light curves via tool-calling. An LLM orchestrates a ReAct loop over transit-fitting tools (jaxoplanet/NumPyro/NUTS), catching corrupted input data and validating convergence before trusting results.
-
-Code is built from scratch upon previous proprietary work done during my time as and undergraduate.
+Built entirely from scratch and scaling upon proprietary methodologies developed during my undergraduate research, this system eliminates manual data cleaning and tuning. By combining a robust Python preprocessing pipeline with an LLM-driven ReAct (Reasoning and Acting) loop, the architecture ensures autonomous, end-to-end data integrity—detecting corrupted inputs and validating model convergence before finalizing downstream scientific results.
