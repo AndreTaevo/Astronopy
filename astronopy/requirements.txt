@@ -1,0 +1,12 @@
+# Core inference stack (tested versions)
+jax>=0.10
+numpyro>=0.21
+jaxoplanet>=0.1
+numpyro-ext>=0.0.4
+jaxopt>=0.8
+arviz>=1.2
+
+# Data fetch + plotting (lazy-imported by the pipeline)
+lightkurve>=2.4
+matplotlib>=3.7
+corner>=2.2
