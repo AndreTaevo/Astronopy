@@ -9,8 +9,9 @@ Design goal
 -----------
 Every stage is a small, single-responsibility function ("tool") that takes plain
 inputs and returns a JSON-friendly summary alongside any heavy artifacts. That
-shape lets the pipeline run two ways:
-
+shape lets the pipeline run two ways: as a plain sequential call, or as tools
+driven by an agent's ReAct loop.
+"""
 
 from __future__ import annotations
 
@@ -28,9 +29,11 @@ import numpyro_ext.optim
 from jaxoplanet.orbits import TransitOrbit
 from jaxoplanet.light_curves import limb_dark_light_curve
 
-# ----------------------------------------------------------------------------
-# Runtime configuration (safe defaults; call configure_runtime() to override)
-# ----------------------------------------------------------------------------
+# Latent (sampled) sites in the model. Deterministics are excluded because
+# init_to_value must only receive sites the sampler actually initialises.
+LATENT_SITES = ("t0", "logP", "logD", "r", "_b", "u")
+
+
 def configure_runtime(host_device_count: int = 2, platform: str = "cpu",
                       enable_x64: bool = True) -> None:
     numpyro.set_host_device_count(host_device_count)
@@ -41,9 +44,6 @@ def configure_runtime(host_device_count: int = 2, platform: str = "cpu",
 configure_runtime()
 
 
-# ----------------------------------------------------------------------------
-# Data containers
-# ----------------------------------------------------------------------------
 @dataclass
 class LightCurve:
     """A stitched, mean-subtracted light curve. `flux` is relative flux - 1."""
@@ -63,12 +63,11 @@ class LightCurve:
 
 @dataclass
 class TransitPriors:
-    """Prior centers and widths for the fit. Centers are usually catalog values."""
-    period: float          # days
-    duration: float        # days
-    ror: float             # planet-to-star radius ratio
-    t0: float              # time of a reference transit (days)
-    b: float = 0.5         # impact parameter (initial guess)
+    period: float
+    duration: float
+    ror: float
+    t0: float
+    b: float = 0.5
     log_period_sd: float = 0.1
     log_duration_sd: float = 0.1
     t0_sd: float = 1.0
@@ -81,25 +80,17 @@ class QualityReport:
     n_non_finite_err: int
     n_non_finite_time: int
     n_nonpositive_err: int
-    n_removed: int
+    n_flagged: int
     n_output: int
-    fraction_removed: float
+    fraction_flagged: float
     verdict: str
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
-# ----------------------------------------------------------------------------
-# Stage 1 — fetch
-# ----------------------------------------------------------------------------
 def fetch_lightcurve(target: str, mission: str = "Kepler",
                      cadence: str = "long") -> LightCurve:
-    """Download and stitch all available light curves for `target`.
-
-    `lightkurve` is imported lazily so the rest of the pipeline (and the agent's
-    synthetic-demo path) works without a live archive connection.
-    """
     import lightkurve as lk
 
     search = lk.search_lightcurve(target, author=mission, cadence=cadence)
@@ -109,23 +100,15 @@ def fetch_lightcurve(target: str, mission: str = "Kepler",
     stitched = search.download_all().stitch()
     return LightCurve(
         time=np.asarray(stitched.time.value, dtype=float),
-        flux=np.asarray(stitched.flux.value, dtype=float) - 1.0,   # center on 0
+        flux=np.asarray(stitched.flux.value, dtype=float) - 1.0,
         flux_err=np.asarray(stitched.flux_err.value, dtype=float),
         target=target,
     )
 
 
-# ----------------------------------------------------------------------------
-# Stage 2 — data-quality review  (the input-stage quality gate)
-# ----------------------------------------------------------------------------
-def review_data_quality(lc: LightCurve, drop_bad: bool = True):
-    """Screen a light curve for corrupted samples *before* any fitting.
-
-    Flags non-finite (NaN/inf) values in time, flux, and flux_err, plus
-    non-positive uncertainties (which would break the Gaussian likelihood).
-    Returns (cleaned_light_curve, QualityReport). The report is JSON-friendly so
-    an agent can read `verdict` and decide whether the data is worth fitting.
-    """
+def review_data_quality(lc: LightCurve, drop_bad: bool = True,
+                        downweight_factor: float = 1e6):
+    """Screen a light curve for corrupted samples *before* any fitting."""
     finite_flux = np.isfinite(lc.flux)
     finite_err = np.isfinite(lc.flux_err)
     finite_time = np.isfinite(lc.time)
@@ -133,26 +116,33 @@ def review_data_quality(lc: LightCurve, drop_bad: bool = True):
 
     good = finite_flux & finite_err & finite_time & positive_err
     n_input = int(lc.time.size)
-    n_removed = int((~good).sum())
+    n_flagged = int((~good).sum())
 
     if drop_bad:
         cleaned = LightCurve(lc.time[good], lc.flux[good], lc.flux_err[good], lc.target)
     else:
-        # Keep length; neutralize bad points by down-weighting (huge error bar).
+        # Keep length; neutralise bad points with a LARGE FINITE error bar.
+        # np.inf would make the Gaussian log-prob non-finite and poison the fit.
+        good_err = lc.flux_err[good]
+        scale = float(np.median(good_err)) if good_err.size else 1.0
+        big = scale * downweight_factor
+        # Non-finite times must also be replaced: a NaN time propagates
+        # through the transit model into the likelihood.
+        safe_time = float(np.median(lc.time[finite_time])) if finite_time.any() else 0.0
         cleaned = LightCurve(
-            time=lc.time,
+            time=np.where(finite_time, lc.time, safe_time),
             flux=np.where(finite_flux, lc.flux, 0.0),
-            flux_err=np.where(positive_err & finite_err, lc.flux_err, np.inf),
+            flux_err=np.where(good, lc.flux_err, big),
             target=lc.target,
         )
 
-    frac = n_removed / n_input if n_input else 0.0
+    frac = n_flagged / n_input if n_input else 0.0
     if frac == 0:
         verdict = "clean: no corrupted samples detected"
     elif frac < 0.05:
-        verdict = f"minor: removed {frac:.1%} of samples, safe to proceed"
+        verdict = f"minor: flagged {frac:.1%} of samples, safe to proceed"
     elif frac < 0.25:
-        verdict = f"caution: removed {frac:.1%} of samples, inspect before trusting the fit"
+        verdict = f"caution: flagged {frac:.1%} of samples, inspect before trusting the fit"
     else:
         verdict = f"reject: {frac:.1%} of samples corrupted, data likely unreliable"
 
@@ -162,17 +152,14 @@ def review_data_quality(lc: LightCurve, drop_bad: bool = True):
         n_non_finite_err=int((~finite_err).sum()),
         n_non_finite_time=int((~finite_time).sum()),
         n_nonpositive_err=int((~positive_err).sum()),
-        n_removed=n_removed,
+        n_flagged=n_flagged,
         n_output=int(cleaned.time.size),
-        fraction_removed=frac,
+        fraction_flagged=frac,
         verdict=verdict,
     )
     return cleaned, report
 
 
-# ----------------------------------------------------------------------------
-# The model — one definition, reused by both MAP and NUTS
-# ----------------------------------------------------------------------------
 def _transit_flux(params: dict, time) -> jnp.ndarray:
     orbit = TransitOrbit(
         period=params["period"],
@@ -184,8 +171,12 @@ def _transit_flux(params: dict, time) -> jnp.ndarray:
     return limb_dark_light_curve(orbit, params["u"])(time)
 
 
-def build_model(priors: TransitPriors):
-    """Return a NumPyro model closed over the given priors."""
+def build_model(priors: TransitPriors, store_light_curve: bool = False):
+    """Return a NumPyro model closed over the given priors.
+
+    `store_light_curve` is off during sampling: recording the full model flux
+    for every draw costs n_chains * n_samples * n_points floats.
+    """
     def model(time, flux_err, flux=None):
         t0 = numpyro.sample("t0", dist.Normal(priors.t0, priors.t0_sd))
 
@@ -206,15 +197,13 @@ def build_model(priors: TransitPriors):
             {"period": period, "duration": duration, "t0": t0, "b": b, "r": r, "u": u},
             time,
         )
-        numpyro.deterministic("light_curve", mu)
+        if store_light_curve:
+            numpyro.deterministic("light_curve", mu)
         numpyro.sample("obs", dist.Normal(mu, flux_err), obs=flux)
 
     return model
 
 
-# ----------------------------------------------------------------------------
-# Stage 3 — MAP point estimate
-# ----------------------------------------------------------------------------
 def fit_map(lc: LightCurve, priors: TransitPriors, seed: int = 0) -> dict:
     """Maximum a posteriori fit: a fast single best-guess parameter set."""
     model = build_model(priors)
@@ -223,7 +212,8 @@ def fit_map(lc: LightCurve, priors: TransitPriors, seed: int = 0) -> dict:
         "logP": jnp.log(priors.period),
         "logD": jnp.log(priors.duration),
         "r": priors.ror,
-        "_b": priors.b / (1.0 + priors.ror),
+        "_b": min(priors.b / (1.0 + priors.ror), 0.99),
+        "u": jnp.array([0.3, 0.2]),
     }
     run_optim = numpyro_ext.optim.optimize(
         model, init_strategy=numpyro.infer.init_to_value(values=init)
@@ -233,16 +223,21 @@ def fit_map(lc: LightCurve, priors: TransitPriors, seed: int = 0) -> dict:
             if k not in ("light_curve", "obs")}
 
 
-# ----------------------------------------------------------------------------
-# Stage 4 — full posterior via NUTS (reuses the SAME model as fit_map)
-# ----------------------------------------------------------------------------
-def run_nuts(lc: LightCurve, priors: TransitPriors, num_warmup: int = 1000,
-             num_samples: int = 2000, num_chains: int = 2,
+def run_nuts(lc: LightCurve, priors: TransitPriors, map_params: Optional[dict] = None,
+             num_warmup: int = 1000, num_samples: int = 2000, num_chains: int = 2,
              target_accept_prob: float = 0.9, seed: int = 1):
-    """Sample the posterior with gradient-based NUTS. Returns the MCMC object."""
+    """Sample the posterior with NUTS, warm-started from the MAP solution."""
     model = build_model(priors)
+
+    if map_params is not None:
+        init_values = {k: jnp.asarray(v) for k, v in map_params.items()
+                       if k in LATENT_SITES}
+        init_strategy = numpyro.infer.init_to_value(values=init_values)
+    else:
+        init_strategy = numpyro.infer.init_to_uniform
+
     kernel = numpyro.infer.NUTS(model, target_accept_prob=target_accept_prob,
-                                dense_mass=True)
+                                dense_mass=True, init_strategy=init_strategy)
     mcmc = numpyro.infer.MCMC(
         kernel, num_warmup=num_warmup, num_samples=num_samples,
         num_chains=num_chains, progress_bar=False,
@@ -251,16 +246,16 @@ def run_nuts(lc: LightCurve, priors: TransitPriors, num_warmup: int = 1000,
     return mcmc
 
 
-# ----------------------------------------------------------------------------
-# Stage 5 — convergence check with an explicit pass/fail verdict
-# ----------------------------------------------------------------------------
 def check_convergence(mcmc, params=("t0", "period", "duration", "r", "b"),
                       rhat_max: float = 1.01, ess_min: float = 400.0) -> dict:
-    """Judge whether the chains converged. Returns a dict the agent can branch on."""
+    """Judge whether the chains converged, without materialising heavy sites."""
     import arviz as az
 
-    idata = az.from_numpyro(mcmc)
-    summ = az.summary(idata, var_names=list(params))
+    by_chain = mcmc.get_samples(group_by_chain=True)
+    posterior = {p: np.asarray(by_chain[p]) for p in params if p in by_chain}
+    summ = az.summary(az.from_dict({"posterior": posterior}),
+                      var_names=list(posterior))
+
     max_rhat = float(summ["r_hat"].max())
     min_ess = float(summ["ess_bulk"].min())
     converged = (max_rhat <= rhat_max) and (min_ess >= ess_min)
@@ -284,9 +279,6 @@ def check_convergence(mcmc, params=("t0", "period", "duration", "r", "b"),
     }
 
 
-# ----------------------------------------------------------------------------
-# Stage 6 — posterior summary (medians + 68% credible intervals)
-# ----------------------------------------------------------------------------
 def summarize_posterior(mcmc, params=("t0", "period", "duration", "r", "b")) -> dict:
     samples = mcmc.get_samples()
     out = {}
@@ -295,18 +287,13 @@ def summarize_posterior(mcmc, params=("t0", "period", "duration", "r", "b")) -> 
             continue
         s = np.asarray(samples[p])
         lo, med, hi = np.percentile(s, [16, 50, 84])
-        out[p] = {"median": float(med),
-                  "minus": float(med - lo),
-                  "plus": float(hi - med)}
+        out[p] = {"median": float(med), "minus": float(med - lo), "plus": float(hi - med)}
     return out
 
 
-# ----------------------------------------------------------------------------
-# Synthetic data — lets the agent be demoed / tested without a live download
-# ----------------------------------------------------------------------------
 def generate_synthetic_lightcurve(priors: TransitPriors, n_points: int = 3000,
-                                   noise: float = 5e-4, inject_bad: int = 0,
-                                   seed: int = 42) -> LightCurve:
+                                  noise: float = 5e-4, inject_bad: int = 0,
+                                  seed: int = 42) -> LightCurve:
     rng = np.random.default_rng(seed)
     time = np.sort(rng.uniform(0, 2.5 * priors.period, size=n_points))
     truth = {"period": priors.period, "duration": priors.duration, "t0": priors.t0,
@@ -314,23 +301,30 @@ def generate_synthetic_lightcurve(priors: TransitPriors, n_points: int = 3000,
     clean = np.asarray(_transit_flux(truth, time))
     flux = clean + rng.normal(0, noise, size=n_points)
     flux_err = np.full(n_points, noise)
-    if inject_bad:                                   # sprinkle in NaN/inf junk
+    if inject_bad:
         idx = rng.choice(n_points, size=inject_bad, replace=False)
         flux[idx[: inject_bad // 2]] = np.nan
         flux[idx[inject_bad // 2:]] = np.inf
     return LightCurve(time, flux, flux_err, target="synthetic")
 
 
-# ----------------------------------------------------------------------------
-# Plain orchestrator — the sequence an agent's ReAct loop reproduces
-# ----------------------------------------------------------------------------
+def model_flux_at(params: dict, time: np.ndarray) -> np.ndarray:
+    """Evaluate the transit model on arbitrary times, for plotting overlays."""
+    p = {
+        "period": float(params["period"]), "duration": float(params["duration"]),
+        "t0": float(params["t0"]), "b": float(params["b"]), "r": float(params["r"]),
+        "u": jnp.asarray(params.get("u", [0.3, 0.2])),
+    }
+    return np.asarray(_transit_flux(p, jnp.asarray(time)))
+
+
 def run_pipeline(lc: LightCurve, priors: TransitPriors, **nuts_kwargs) -> dict:
     cleaned, quality = review_data_quality(lc)
-    if quality.fraction_removed >= 0.25:
+    if quality.fraction_flagged >= 0.25:
         return {"stopped_at": "quality", "quality": quality.to_dict()}
 
     map_params = fit_map(cleaned, priors)
-    mcmc = run_nuts(cleaned, priors, **nuts_kwargs)
+    mcmc = run_nuts(cleaned, priors, map_params=map_params, **nuts_kwargs)
     convergence = check_convergence(mcmc)
     posterior = summarize_posterior(mcmc)
 
@@ -346,11 +340,9 @@ def run_pipeline(lc: LightCurve, priors: TransitPriors, **nuts_kwargs) -> dict:
 
 
 if __name__ == "__main__":
-    # Self-contained smoke test on synthetic data (no network needed).
+    import json
     priors = TransitPriors(period=8.0, duration=0.3, ror=0.1, t0=1.0, b=0.4)
     lc = generate_synthetic_lightcurve(priors, n_points=2500, inject_bad=40)
     result = run_pipeline(lc, priors, num_warmup=400, num_samples=600, num_chains=2)
-
-    import json
     print(json.dumps({k: result[k] for k in ("data", "quality", "convergence", "posterior")},
                      indent=2, default=str))
