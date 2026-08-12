@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>astronopy</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  h1 { font-size: 1.5rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  form { display: flex; flex-wrap: wrap; gap: .75rem; align-items: end; }
+  label { display: flex; flex-direction: column; font-size: .8rem; gap: .2rem; }
+  input { width: 6.5rem; padding: .3rem; }
+  button { padding: .5rem 1.2rem; font-size: 1rem; cursor: pointer; }
+  #status { font-weight: 600; margin-left: .5rem; }
+  #status.running { color: #b8860b; } #status.done { color: #1a7f37; } #status.failed { color: #b31d28; }
+  #steps { background: #f6f8fa; border: 1px solid #ddd; border-radius: 6px; padding: .8rem 1rem;
+           font-family: ui-monospace, monospace; font-size: .8rem; white-space: pre-wrap;
+           max-height: 240px; overflow-y: auto; }
+  .plot { width: 100%; height: 380px; margin-top: 1rem; }
+  #postgrid { display: grid; grid-template-columns: 1fr 1fr; gap: .5rem; }
+  #postgrid .plot { height: 260px; }
+</style>
+</head>
+<body>
+<h1>astronopy — transit fit demo</h1>
+<p>Generates a synthetic Kepler-like light curve (with corrupted samples injected),
+runs the quality gate, MAP fit, and NUTS posterior sampling, then draws the results.
+NUTS takes minutes on CPU — watch the step log while it runs.</p>
+
+<form id="form">
+  <label>points <input name="n_points" type="number" value="1200"></label>
+  <label>bad samples <input name="inject_bad" type="number" value="30"></label>
+  <label>period (d) <input name="period" type="number" step="0.1" value="8.0"></label>
+  <label>radius ratio <input name="ror" type="number" step="0.01" value="0.10"></label>
+  <label>warmup <input name="num_warmup" type="number" value="500"></label>
+  <label>samples <input name="num_samples" type="number" value="800"></label>
+  <button type="button" id="start">Start run</button>
+  <span id="status"></span>
+</form>
+
+<h2>Agent step log</h2>
+<div id="steps">no run yet</div>
+
+<h2>Light curve + MAP model</h2>
+<div id="lc" class="plot"></div>
+
+<h2>Phase-folded transit (the money plot)</h2>
+<div id="fold" class="plot"></div>
+
+<h2>Posterior distributions (68% interval shaded)</h2>
+<div id="postgrid"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null;
+
+$("start").onclick = async () => {
+  const f = new FormData($("form"));
+  const body = {};
+  for (const [k, v] of f.entries()) body[k] = Number(v);
+  const res = await fetch("/runs", { method: "POST",
+    headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) { $("status").textContent = "request rejected: " + (await res.text()); return; }
+  const { run_id } = await res.json();
+  $("status").className = "running"; $("status").textContent = "running " + run_id;
+  clearInterval(timer);
+  timer = setInterval(() => poll(run_id), 2000);
+};
+
+async function poll(id) {
+  const run = await (await fetch(`/runs/${id}`)).json();
+  $("steps").textContent = run.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  $("steps").scrollTop = $("steps").scrollHeight;
+  if (run.status === "running") return;
+  clearInterval(timer);
+  $("status").className = run.status; $("status").textContent = run.status;
+  if (run.status === "failed") { $("steps").textContent += "\n\n" + run.error; return; }
+  if (run.result && run.result.stopped_at === "quality") return;
+  drawAll(id);
+}
+
+async function drawAll(id) {
+  const lc = await (await fetch(`/runs/${id}/lightcurve`)).json();
+  Plotly.newPlot("lc", [
+    { x: lc.time, y: lc.flux, mode: "markers", marker: { size: 3, color: "#888" }, name: "data" },
+    { x: lc.model_time, y: lc.model_flux, mode: "lines", line: { color: "#d62728" }, name: "MAP model" },
+  ], { margin: { t: 20 }, xaxis: { title: "time (d)" }, yaxis: { title: "relative flux" } });
+
+  const fd = await (await fetch(`/runs/${id}/folded`)).json();
+  Plotly.newPlot("fold", [
+    { x: fd.phase, y: fd.flux, mode: "markers", marker: { size: 3, color: "#888" }, name: "data" },
+    { x: fd.model_phase, y: fd.model_flux, mode: "lines", line: { color: "#d62728" }, name: "model" },
+  ], { margin: { t: 20 },
+       xaxis: { title: `phase (d), P=${fd.period.toFixed(4)}`, range: [-1.5, 1.5] },
+       yaxis: { title: "relative flux" } });
+
+  const post = await (await fetch(`/runs/${id}/posterior`)).json();
+  $("postgrid").innerHTML = "";
+  for (const [name, h] of Object.entries(post)) {
+    const div = document.createElement("div");
+    div.className = "plot"; div.id = "post_" + name;
+    $("postgrid").appendChild(div);
+    const centers = h.edges.slice(0, -1).map((e, i) => (e + h.edges[i + 1]) / 2);
+    Plotly.newPlot(div.id,
+      [{ x: centers, y: h.counts, type: "bar", marker: { color: "#4c78a8" } }],
+      { margin: { t: 30 }, title: { text: name, font: { size: 13 } }, bargap: 0,
+        shapes: [{ type: "rect", x0: h.lo, x1: h.hi, y0: 0, y1: Math.max(...h.counts),
+                   fillcolor: "#4c78a8", opacity: 0.15, line: { width: 0 } }] });
+  }
+}
+</script>
+</body>
+</html>
