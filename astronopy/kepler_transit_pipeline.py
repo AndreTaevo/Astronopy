@@ -1,6 +1,6 @@
 """
 kepler_transit_pipeline.py
-==========================
+-----------
 
 An independent re-implementation of a standard Kepler transit-fitting workflow,
 written from public methodology (the jaxoplanet / NumPyro transit-fitting recipe).
