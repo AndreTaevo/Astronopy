@@ -1,6 +1,6 @@
 """
 app.py — astronopy v0 web backend
-=================================
+----------
 
 One file, no database, no queue. A run is started with POST /runs, executes in a
 background thread, appends human-readable steps as it goes, and exposes three
